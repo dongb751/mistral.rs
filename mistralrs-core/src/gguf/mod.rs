@@ -29,6 +29,8 @@ pub enum GGUFArchitecture {
     Qwen2,
     Qwen3,
     Qwen3MoE,
+    Qwen35,
+    Qwen35MoE,
     Mistral3,
 }
 

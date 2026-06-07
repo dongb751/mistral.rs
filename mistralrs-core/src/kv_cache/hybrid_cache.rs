@@ -138,9 +138,17 @@ impl RecurrentStatePool {
         self.conv_state.index_select(state_indices, 0)
     }
 
+    pub fn gather_conv_state_slot(&self, slot_idx: usize) -> Result<Tensor> {
+        self.conv_state.i(slot_idx)?.unsqueeze(0)
+    }
+
     /// Gather recurrent states for the given slot indices
     pub fn gather_recurrent_state(&self, state_indices: &Tensor) -> Result<Tensor> {
         self.recurrent_state.index_select(state_indices, 0)
+    }
+
+    pub fn gather_recurrent_state_slot(&self, slot_idx: usize) -> Result<Tensor> {
+        self.recurrent_state.i(slot_idx)?.unsqueeze(0)
     }
 
     /// Scatter conv states back to the pool for the given slot indices
@@ -159,6 +167,10 @@ impl RecurrentStatePool {
             self.conv_state.slice_set(&value, 0, slot_idx as usize)?;
         }
         Ok(())
+    }
+
+    pub fn scatter_conv_state_slot(&mut self, slot_idx: usize, value: &Tensor) -> Result<()> {
+        self.conv_state.slice_set(&value.contiguous()?, 0, slot_idx)
     }
 
     pub fn scatter_conv_state_with_host_indices(
@@ -195,6 +207,11 @@ impl RecurrentStatePool {
                 .slice_set(&value, 0, slot_idx as usize)?;
         }
         Ok(())
+    }
+
+    pub fn scatter_recurrent_state_slot(&mut self, slot_idx: usize, value: &Tensor) -> Result<()> {
+        self.recurrent_state
+            .slice_set(&value.contiguous()?, 0, slot_idx)
     }
 
     pub fn scatter_recurrent_state_with_host_indices(

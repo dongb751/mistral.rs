@@ -329,7 +329,11 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
-            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
+            GGUFArchitecture::Qwen2
+            | GGUFArchitecture::Qwen3
+            | GGUFArchitecture::Qwen35
+            | GGUFArchitecture::Qwen3MoE
+            | GGUFArchitecture::Qwen35MoE => {
                 let token_embd = tensor_info_size_in_bytes!(
                     self.model.tensor_info("token_embd.weight")?,
                     DType::F32
@@ -382,10 +386,16 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
                     DType::F32
                 );
-                let ffn_norm = tensor_info_size_in_bytes!(
-                    self.model.tensor_info("blk.0.ffn_norm.weight")?,
-                    DType::F32
-                );
+                let ffn_norm_name = if matches!(
+                    self.arch,
+                    GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE
+                ) {
+                    "blk.0.post_attention_norm.weight"
+                } else {
+                    "blk.0.ffn_norm.weight"
+                };
+                let ffn_norm =
+                    tensor_info_size_in_bytes!(self.model.tensor_info(ffn_norm_name)?, DType::F32);
 
                 let attn_q =
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.weight")?);
@@ -494,6 +504,108 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
 
                 attn_norm + ffn_norm + attn_qkv + attn_output + ffn_up + ffn_down
             }
+            GGUFArchitecture::Qwen35 | GGUFArchitecture::Qwen35MoE => {
+                let full_attention_interval = self
+                    .model
+                    .get_metadata()
+                    .get(&format!("{}.full_attention_interval", self.arch))
+                    .map(|x| x.to_u32().map(|x| x as usize))
+                    .transpose()?
+                    .unwrap_or(4);
+                let num_layers = self.num_layers(config)?;
+                let mut sizes = Vec::with_capacity(num_layers);
+                for layer_idx in 0..num_layers {
+                    let prefix = format!("blk.{layer_idx}");
+                    let attn_norm = tensor_info_size_in_bytes!(
+                        self.model
+                            .tensor_info(&format!("{prefix}.attn_norm.weight"))?,
+                        DType::F32
+                    );
+                    let ffn_norm = tensor_info_size_in_bytes!(
+                        self.model
+                            .tensor_info(&format!("{prefix}.post_attention_norm.weight"))?,
+                        DType::F32
+                    );
+                    let ffn_gate = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{prefix}.ffn_gate.weight"))?);
+                    let ffn_up = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{prefix}.ffn_up.weight"))?);
+                    let ffn_down = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{prefix}.ffn_down.weight"))?);
+
+                    let layer_specific = if (layer_idx + 1) % full_attention_interval == 0 {
+                        let attn_q = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.attn_q.weight"))?);
+                        let attn_q_norm = tensor_info_size_in_bytes!(
+                            self.model
+                                .tensor_info(&format!("{prefix}.attn_q_norm.weight"))?,
+                            DType::F32
+                        );
+                        let attn_k = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.attn_k.weight"))?);
+                        let attn_k_norm = tensor_info_size_in_bytes!(
+                            self.model
+                                .tensor_info(&format!("{prefix}.attn_k_norm.weight"))?,
+                            DType::F32
+                        );
+                        let attn_v = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.attn_v.weight"))?);
+                        let attn_output = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.attn_output.weight"))?);
+                        attn_q + attn_q_norm + attn_k + attn_k_norm + attn_v + attn_output
+                    } else {
+                        let attn_qkv = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.attn_qkv.weight"))?);
+                        let attn_gate = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.attn_gate.weight"))?);
+                        let ssm_a = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.ssm_a"))?);
+                        let ssm_alpha = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.ssm_alpha.weight"))?);
+                        let ssm_beta = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.ssm_beta.weight"))?);
+                        let ssm_conv1d = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.ssm_conv1d.weight"))?);
+                        let ssm_dt = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.ssm_dt.bias"))?);
+                        let ssm_norm = tensor_info_size_in_bytes!(
+                            self.model
+                                .tensor_info(&format!("{prefix}.ssm_norm.weight"))?,
+                            DType::F32
+                        );
+                        let ssm_out = tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info(&format!("{prefix}.ssm_out.weight"))?);
+                        attn_qkv
+                            + attn_gate
+                            + ssm_a
+                            + ssm_alpha
+                            + ssm_beta
+                            + ssm_conv1d
+                            + ssm_dt
+                            + ssm_norm
+                            + ssm_out
+                    };
+
+                    sizes
+                        .push(attn_norm + ffn_norm + ffn_gate + ffn_up + ffn_down + layer_specific);
+                }
+                return Ok(sizes);
+            }
             GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
                 let attn_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
@@ -528,7 +640,10 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     .model
                     .tensor_info("blk.0.attn_output.weight")?);
 
-                let ffn_gate = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_gate = if matches!(
+                    self.arch,
+                    GGUFArchitecture::Qwen3MoE | GGUFArchitecture::Qwen35MoE
+                ) {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_gate_exps.weight")?)
@@ -536,7 +651,10 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?)
                 };
 
-                let ffn_up = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_up = if matches!(
+                    self.arch,
+                    GGUFArchitecture::Qwen3MoE | GGUFArchitecture::Qwen35MoE
+                ) {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_up_exps.weight")?)
@@ -544,7 +662,10 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_up.weight")?)
                 };
 
-                let ffn_down = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_down = if matches!(
+                    self.arch,
+                    GGUFArchitecture::Qwen3MoE | GGUFArchitecture::Qwen35MoE
+                ) {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_down_exps.weight")?)

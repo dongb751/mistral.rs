@@ -540,3 +540,105 @@ template <typename T>
 
 instantiate_gdn_gating(half);
 instantiate_gdn_gating(bfloat16_t);
+
+// ============================================================================
+// Kernel 4: fused_l2_norm
+//
+// Fuses: sqr → sum → add(eps) → sqrt → recip → mul
+// Input:  x shape [num_rows, head_dim]
+// Output: same shape, normalizes each row to unit L2 norm
+// ============================================================================
+
+template <typename T>
+[[kernel]] void l2_norm_kernel(
+    const device T *x [[buffer(0)]],
+    device T *output [[buffer(1)]],
+    constant int &num_rows [[buffer(2)]],
+    constant int &head_dim [[buffer(3)]],
+    constant float &eps [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint tiisg [[thread_index_in_threadgroup]]) {
+  const int row = gid.x;
+  if (row >= num_rows) return;
+
+  const int D = head_dim;
+  const int stride = 32;
+
+  float partial = 0.0f;
+  for (int d = (int)tiisg; d < D; d += stride) {
+    float v = (float)x[row * D + d];
+    partial += v * v;
+  }
+
+  float sum_sq = simd_sum(partial);
+  float inv_norm = 1.0f / sqrt(sum_sq + eps);
+
+  for (int d = (int)tiisg; d < D; d += stride) {
+    output[row * D + d] = (T)((float)x[row * D + d] * inv_norm);
+  }
+}
+
+#define instantiate_l2_norm(type)                                              \
+  template [[host_name("l2_norm_" #type)]] [[kernel]]                          \
+  void l2_norm_kernel<type>(                                                   \
+      const device type *, device type *, constant int &, constant int &,      \
+      constant float &, uint2, uint);
+
+instantiate_l2_norm(half);
+instantiate_l2_norm(bfloat16_t);
+
+// ============================================================================
+// Kernel 5: fused_rms_norm_gated
+//
+// Fuses: to_f32 → sqr → mean → add(eps) → sqrt → div → mul(weight) →
+//        silu(gate) → to_dtype
+//
+// Input:  x, gate [num_rows, head_dim], weight [head_dim] (F32)
+// Output: [num_rows, head_dim], rms_norm(x) * weight * silu(gate)
+// ============================================================================
+
+template <typename T>
+[[kernel]] void rms_norm_gated_kernel(
+    const device T *x [[buffer(0)]],
+    const device T *gate [[buffer(1)]],
+    const device float *weight [[buffer(2)]],
+    device T *output [[buffer(3)]],
+    constant int &num_rows [[buffer(4)]],
+    constant int &head_dim [[buffer(5)]],
+    constant float &eps [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint tiisg [[thread_index_in_threadgroup]]) {
+  const int row = gid.x;
+  if (row >= num_rows) return;
+
+  const int D = head_dim;
+  const int stride = 32;
+
+  float partial = 0.0f;
+  for (int d = (int)tiisg; d < D; d += stride) {
+    float v = (float)x[row * D + d];
+    partial += v * v;
+  }
+
+  float variance = simd_sum(partial) / (float)D;
+  float rms_rsqrt = 1.0f / sqrt(variance + eps);
+
+  for (int d = (int)tiisg; d < D; d += stride) {
+    float x_f32 = (float)x[row * D + d];
+    float g_f32 = (float)gate[row * D + d];
+    float gate_sig = 1.0f / (1.0f + exp(-g_f32));
+    float gate_silu = g_f32 * gate_sig;
+    float result = x_f32 * rms_rsqrt * weight[d] * gate_silu;
+    output[row * D + d] = (T)result;
+  }
+}
+
+#define instantiate_rms_norm_gated(type)                                       \
+  template [[host_name("rms_norm_gated_" #type)]] [[kernel]]                   \
+  void rms_norm_gated_kernel<type>(                                            \
+      const device type *, const device type *, const device float *,          \
+      device type *, constant int &, constant int &, constant float &, uint2,  \
+      uint);
+
+instantiate_rms_norm_gated(half);
+instantiate_rms_norm_gated(bfloat16_t);

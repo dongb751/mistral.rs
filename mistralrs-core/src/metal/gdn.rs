@@ -7,7 +7,7 @@
 #[cfg(feature = "metal")]
 use candle_core::backend::BackendStorage;
 #[cfg(feature = "metal")]
-use candle_core::{DType, Device, Result, Storage, Tensor};
+use candle_core::{DType, Device, Result, Storage, Tensor, D};
 
 #[cfg(feature = "metal")]
 use candle_metal_kernels::metal::{
@@ -435,42 +435,19 @@ pub fn causal_conv1d_metal(
             encoder.dispatch_thread_groups(thread_groups, threads_per_group);
         }
 
-        // Save conv state kernel
-        let save_name = format!("save_conv_state_{type_suffix}");
-        let save_pipeline = load_pipeline(dev.device(), &save_name)?;
-
-        let new_conv_state = Tensor::zeros((batch_size, conv_dim, kernel_size), dtype, x.device())?;
-        let (cs_buf, cs_off) = metal_buffer_and_offset(&new_conv_state)?;
-
-        {
-            let encoder = dev.command_encoder()?;
-            let encoder: &ComputeCommandEncoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&save_pipeline);
-
-            encoder.set_input_buffer(0, Some(&x_buf), x_off);
-            encoder.set_output_buffer(1, Some(&cs_buf), cs_off);
-
-            let bs = batch_size as i32;
-            let cd = conv_dim as i32;
-            let sl = seq_len as i32;
-            let ks = kernel_size as i32;
-            encoder.set_bytes(2, &bs);
-            encoder.set_bytes(3, &cd);
-            encoder.set_bytes(4, &sl);
-            encoder.set_bytes(5, &ks);
-
-            let thread_groups = MTLSize {
-                width: conv_dim.div_ceil(256),
-                height: batch_size,
-                depth: 1,
-            };
-            let threads_per_group = MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            };
-            encoder.dispatch_thread_groups(thread_groups, threads_per_group);
-        }
+        // Save conv state from last kernel_size columns of input (narrow + contiguous
+        // avoids a separate kernel launch and pipeline compilation).
+        let new_conv_state = if seq_len >= kernel_size {
+            x.narrow(2, seq_len - kernel_size, kernel_size)?
+                .contiguous()?
+        } else {
+            let pad = Tensor::zeros(
+                (batch_size, conv_dim, kernel_size - seq_len),
+                dtype,
+                x.device(),
+            )?;
+            Tensor::cat(&[&pad, &x], 2)?.contiguous()?
+        };
 
         Ok((output, new_conv_state))
     }
@@ -578,4 +555,163 @@ pub fn fused_gdn_gating_metal(
     _dt_bias: &candle_core::Tensor,
 ) -> candle_core::Result<(candle_core::Tensor, candle_core::Tensor)> {
     candle_core::bail!("fused_gdn_gating_metal requires the metal feature")
+}
+
+// ============================================================================
+// Public API: l2_norm_metal (fused)
+// ============================================================================
+
+/// Fused L2 normalization on Metal.
+///
+/// x: [num_rows, head_dim]
+/// Returns: same shape, L2-normalized
+#[cfg(feature = "metal")]
+pub fn l2_norm_metal(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let x = x.contiguous()?;
+    let dtype = x.dtype();
+    let type_suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat16_t",
+        _ => candle_core::bail!("l2_norm_metal: unsupported dtype {dtype:?}, expected F16 or BF16"),
+    };
+
+    let num_rows = x.elem_count() / x.dim(D::Minus1)?;
+    let head_dim = x.dim(D::Minus1)?;
+
+    let Device::Metal(dev) = x.device() else {
+        candle_core::bail!("l2_norm_metal: expected Metal device");
+    };
+
+    let kernel_name = format!("l2_norm_{type_suffix}");
+    let pipeline = load_pipeline(dev.device(), &kernel_name)?;
+
+    let output = Tensor::zeros(x.shape(), dtype, x.device())?;
+
+    let (x_buf, x_off) = metal_buffer_and_offset(&x)?;
+    let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
+
+    let encoder = dev.command_encoder()?;
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_input_buffer(0, Some(&x_buf), x_off);
+    encoder.set_output_buffer(1, Some(&out_buf), out_off);
+
+    let nr = num_rows as i32;
+    let hd = head_dim as i32;
+    let eps_f = eps as f32;
+    encoder.set_bytes(2, &nr);
+    encoder.set_bytes(3, &hd);
+    encoder.set_bytes(4, &eps_f);
+
+    let thread_groups = MTLSize {
+        width: num_rows,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_group = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups, threads_per_group);
+
+    Ok(output)
+}
+
+#[cfg(not(feature = "metal"))]
+#[allow(dead_code)]
+pub fn l2_norm_metal(
+    _x: &candle_core::Tensor,
+    _eps: f64,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("l2_norm_metal requires the metal feature")
+}
+
+// ============================================================================
+// Public API: rms_norm_gated_metal (fused)
+// ============================================================================
+
+/// Fused RMSNorm with gating on Metal.
+///
+/// x, gate: [num_rows, head_dim]
+/// weight: [head_dim] (F32)
+/// Returns: same shape, rms_norm(x) * weight * silu(gate)
+#[cfg(feature = "metal")]
+pub fn rms_norm_gated_metal(
+    x: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Result<Tensor> {
+    let x = x.contiguous()?;
+    let gate = gate.contiguous()?;
+    let weight = weight.to_dtype(DType::F32)?.contiguous()?;
+
+    let dtype = x.dtype();
+    let type_suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat16_t",
+        _ => candle_core::bail!(
+            "rms_norm_gated_metal: unsupported dtype {dtype:?}, expected F16 or BF16"
+        ),
+    };
+
+    let num_rows = x.elem_count() / x.dim(D::Minus1)?;
+    let head_dim = x.dim(D::Minus1)?;
+
+    let Device::Metal(dev) = x.device() else {
+        candle_core::bail!("rms_norm_gated_metal: expected Metal device");
+    };
+
+    let kernel_name = format!("rms_norm_gated_{type_suffix}");
+    let pipeline = load_pipeline(dev.device(), &kernel_name)?;
+
+    let output = Tensor::zeros(x.shape(), dtype, x.device())?;
+
+    let (x_buf, x_off) = metal_buffer_and_offset(&x)?;
+    let (gate_buf, gate_off) = metal_buffer_and_offset(&gate)?;
+    let (w_buf, w_off) = metal_buffer_and_offset(&weight)?;
+    let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
+
+    let encoder = dev.command_encoder()?;
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_input_buffer(0, Some(&x_buf), x_off);
+    encoder.set_input_buffer(1, Some(&gate_buf), gate_off);
+    encoder.set_input_buffer(2, Some(&w_buf), w_off);
+    encoder.set_output_buffer(3, Some(&out_buf), out_off);
+
+    let nr = num_rows as i32;
+    let hd = head_dim as i32;
+    let eps_f = eps as f32;
+    encoder.set_bytes(4, &nr);
+    encoder.set_bytes(5, &hd);
+    encoder.set_bytes(6, &eps_f);
+
+    let thread_groups = MTLSize {
+        width: num_rows,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_group = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups, threads_per_group);
+
+    Ok(output)
+}
+
+#[cfg(not(feature = "metal"))]
+#[allow(dead_code)]
+pub fn rms_norm_gated_metal(
+    _x: &candle_core::Tensor,
+    _gate: &candle_core::Tensor,
+    _weight: &candle_core::Tensor,
+    _eps: f64,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_core::bail!("rms_norm_gated_metal requires the metal feature")
 }
