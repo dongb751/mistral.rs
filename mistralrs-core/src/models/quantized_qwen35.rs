@@ -835,6 +835,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     props.linear_key_head_dim,
                     props.linear_value_head_dim,
                 ],
+                recurrent_dtype: Some(dtype),
             },
         };
         let cache = EitherCache::Hybrid(Arc::new(std::sync::Mutex::new(HybridCache::new(
@@ -922,7 +923,7 @@ impl ModelWeights {
                     let mut gdn_cache = GdnLayerCache {
                         conv_state,
                         recurrent_state,
-                        seqlen_offset: pool.get_seqlen_offset(0),
+                        seqlen_offset: start_offsets[0],
                     };
                     let out = attn.forward(&x_norm, &mut gdn_cache)?;
                     // Use slot-based scatter (no to_vec1 sync) to avoid GPU pipeline drain.
@@ -936,7 +937,7 @@ impl ModelWeights {
                         slot_idx,
                         &gdn_cache.recurrent_state.to_dtype(recurrent_dtype)?,
                     )?;
-                    pool.set_seqlen_offset(slot_idx, gdn_cache.seqlen_offset);
+                    // seqlen_offset is maintained externally by the pipeline via start_offsets
                     out
                 }
                 _ => candle_core::bail!("Qwen3.5 GGUF layer/cache type mismatch at layer {i}"),
